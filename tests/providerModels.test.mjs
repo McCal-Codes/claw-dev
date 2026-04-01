@@ -11,11 +11,12 @@ import {
 test("providerLabel returns human readable provider names", () => {
   assert.equal(providerLabel("openai"), "OpenAI");
   assert.equal(providerLabel("gemini"), "Google Gemini");
+  assert.equal(providerLabel("openrouter"), "OpenRouter");
 });
 
 test("providerModelCatalog includes active model and defaults", () => {
-  const catalog = providerModelCatalog("openai", { OPENAI_MODEL: "gpt-5.4" });
-  assert.equal(catalog[0], "gpt-5.4");
+  const catalog = providerModelCatalog("openai", { OPENAI_MODEL: "gpt-5.2" });
+  assert.equal(catalog[0], "gpt-5.2");
   assert.ok(catalog.includes("gpt-4.1"));
   assert.ok(catalog.includes("o4-mini"));
 });
@@ -35,6 +36,13 @@ test("providerPromptSuggestions mirrors the provider catalog", () => {
 });
 
 test("providerAdditionalModelOptions are picker-friendly", () => {
-  const options = providerAdditionalModelOptions("openai", { OPENAI_MODEL: "gpt-5.4" });
-  assert.ok(options.some((option) => option.value === "gpt-5.4" && option.description === "OpenAI model"));
+  const options = providerAdditionalModelOptions("openai", { OPENAI_MODEL: "gpt-5.2" });
+  assert.ok(options.some((option) => option.value === "gpt-5.2" && option.description === "OpenAI model"));
+});
+
+test("openrouter catalog includes provider-qualified model ids", () => {
+  const catalog = providerModelCatalog("openrouter", { OPENROUTER_MODEL: "anthropic/claude-sonnet-4" });
+  assert.equal(catalog[0], "anthropic/claude-sonnet-4");
+  assert.ok(catalog.includes("google/gemini-2.5-flash"));
+  assert.ok(catalog.includes("openai/gpt-oss-120b"));
 });

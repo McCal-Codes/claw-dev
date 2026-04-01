@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 import { FunctionCallingConfigMode, GoogleGenAI, createPartFromFunctionResponse } from "@google/genai";
@@ -14,7 +14,7 @@ import { providerLabel, providerModelCatalog } from "../shared/providerModels.js
 
 loadEnv({ quiet: true });
 
-type CompatProvider = "openai" | "gemini" | "groq" | "ollama" | "copilot" | "zai";
+type CompatProvider = "openai" | "gemini" | "groq" | "openrouter" | "ollama" | "copilot" | "zai";
 
 type AnthropicMessageRequest = {
   model?: string;
@@ -77,16 +77,33 @@ const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY?.trim();
 const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE?.trim();
 const OLLAMA_NUM_CTX = parseOptionalInt(process.env.OLLAMA_NUM_CTX);
 const OLLAMA_NUM_PREDICT = parseOptionalInt(process.env.OLLAMA_NUM_PREDICT);
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
-const GROQ_API_KEY = process.env.GROQ_API_KEY?.trim();
+const GEMINI_API_KEY = readConfiguredSecret(process.env.GEMINI_API_KEY);
+const GROQ_API_KEY = readConfiguredSecret(process.env.GROQ_API_KEY);
+const OPENROUTER_API_KEY = readConfiguredSecret(process.env.OPENROUTER_API_KEY);
+const OPENROUTER_BASE_URL = normalizeBaseUrl(process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1");
+const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL?.trim();
+const OPENROUTER_APP_NAME = process.env.OPENROUTER_APP_NAME?.trim();
 const COPILOT_TOKEN =
-  process.env.COPILOT_TOKEN?.trim() ||
-  process.env.GITHUB_MODELS_TOKEN?.trim() ||
-  process.env.GITHUB_TOKEN?.trim() ||
-  process.env.GH_TOKEN?.trim();
-const ZAI_API_KEY = process.env.ZAI_API_KEY?.trim();
+  readConfiguredSecret(process.env.COPILOT_TOKEN) ||
+  readConfiguredSecret(process.env.GITHUB_MODELS_TOKEN) ||
+  readConfiguredSecret(process.env.GITHUB_TOKEN) ||
+  readConfiguredSecret(process.env.GH_TOKEN);
+const ZAI_API_KEY = readConfiguredSecret(process.env.ZAI_API_KEY);
+const LOCAL_PROXY_AUTH_TOKEN = readConfiguredSecret(process.env.ANTHROPIC_AUTH_TOKEN);
 const geminiClient = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
 const OPENAI_AUTH = PROVIDER === "openai" ? resolveOpenAIAuth({ env: process.env }) : null;
+
+class CompatProxyError extends Error {
+  statusCode: number;
+  errorType: string;
+
+  constructor(message: string, statusCode = 500, errorType = "api_error") {
+    super(message);
+    this.name = "CompatProxyError";
+    this.statusCode = statusCode;
+    this.errorType = errorType;
+  }
+}
 
 assertProviderConfiguration();
 
@@ -101,6 +118,8 @@ const server = createServer(async (req, res) => {
         model: ACTIVE_MODEL,
       });
     }
+
+    assertLocalProxyAuth(req);
 
     if (req.method === "GET" && url.pathname === "/v1/models") {
       return sendJson(res, 200, buildModelsPage());
@@ -135,10 +154,12 @@ const server = createServer(async (req, res) => {
       },
     });
   } catch (error) {
-    return sendJson(res, 500, {
+    const statusCode = error instanceof CompatProxyError ? error.statusCode : 500;
+    const errorType = error instanceof CompatProxyError ? error.errorType : "api_error";
+    return sendJson(res, statusCode, {
       type: "error",
       error: {
-        type: "api_error",
+        type: errorType,
         message: error instanceof Error ? error.message : String(error),
       },
     });
@@ -168,6 +189,10 @@ function resolveProvider(): CompatProvider {
     return "copilot";
   }
 
+  if (raw === "router") {
+    return "openrouter";
+  }
+
   if (raw === "z.ai") {
     return "zai";
   }
@@ -176,7 +201,15 @@ function resolveProvider(): CompatProvider {
     return "openai";
   }
 
-  if (raw === "openai" || raw === "gemini" || raw === "groq" || raw === "ollama" || raw === "copilot" || raw === "zai") {
+  if (
+    raw === "openai" ||
+    raw === "gemini" ||
+    raw === "groq" ||
+    raw === "openrouter" ||
+    raw === "ollama" ||
+    raw === "copilot" ||
+    raw === "zai"
+  ) {
     return raw;
   }
 
@@ -191,6 +224,8 @@ function defaultPortFor(provider: CompatProvider): string {
       return "8788";
     case "groq":
       return "8789";
+    case "openrouter":
+      return "8793";
     case "ollama":
       return "8792";
     case "copilot":
@@ -203,11 +238,13 @@ function defaultPortFor(provider: CompatProvider): string {
 function resolveModel(provider: CompatProvider): string {
   switch (provider) {
     case "openai":
-      return process.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini";
+      return process.env.OPENAI_MODEL?.trim() || "gpt-5-mini";
     case "gemini":
       return process.env.GEMINI_MODEL?.trim() || "gemini-2.5-flash";
     case "groq":
       return process.env.GROQ_MODEL?.trim() || "openai/gpt-oss-20b";
+    case "openrouter":
+      return process.env.OPENROUTER_MODEL?.trim() || "anthropic/claude-sonnet-4";
     case "ollama":
       return process.env.OLLAMA_MODEL?.trim() || "qwen3";
     case "copilot":
@@ -226,25 +263,91 @@ function assertProviderConfiguration(): void {
       reason: "auth-not-initialized",
     };
     if (auth.status !== "ok") {
-      throw new Error(formatOpenAIAuthHint(auth));
+      throw new CompatProxyError(formatOpenAIAuthHint(auth), 400, "authentication_error");
     }
   }
 
   if (PROVIDER === "gemini" && !GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY is required when ANTHROPIC_COMPAT_PROVIDER=gemini");
+    throw new CompatProxyError(
+      "Gemini is not configured. Set GEMINI_API_KEY, then restart Claw Dev and choose Gemini again.",
+      400,
+      "authentication_error",
+    );
   }
 
   if (PROVIDER === "groq" && !GROQ_API_KEY) {
-    throw new Error("GROQ_API_KEY is required when ANTHROPIC_COMPAT_PROVIDER=groq");
+    throw new CompatProxyError(
+      "Groq is not configured. Set GROQ_API_KEY, then restart Claw Dev and choose Groq again.",
+      400,
+      "authentication_error",
+    );
+  }
+
+  if (PROVIDER === "openrouter" && !OPENROUTER_API_KEY) {
+    throw new CompatProxyError(
+      "OpenRouter is not configured. Set OPENROUTER_API_KEY, then restart Claw Dev and choose OpenRouter again.",
+      400,
+      "authentication_error",
+    );
   }
 
   if (PROVIDER === "copilot" && !COPILOT_TOKEN) {
-    throw new Error("COPILOT_TOKEN or GITHUB_MODELS_TOKEN is required when ANTHROPIC_COMPAT_PROVIDER=copilot");
+    throw new CompatProxyError(
+      "Copilot is not configured. Set COPILOT_TOKEN or GITHUB_MODELS_TOKEN before using the GitHub Models path.",
+      400,
+      "authentication_error",
+    );
   }
 
   if (PROVIDER === "zai" && !ZAI_API_KEY) {
-    throw new Error("ZAI_API_KEY is required when ANTHROPIC_COMPAT_PROVIDER=zai");
+    throw new CompatProxyError(
+      "z.ai is not configured. Set ZAI_API_KEY, then restart Claw Dev and choose z.ai again.",
+      400,
+      "authentication_error",
+    );
   }
+}
+
+function assertLocalProxyAuth(req: IncomingMessage): void {
+  if (!LOCAL_PROXY_AUTH_TOKEN) {
+    return;
+  }
+
+  const bearerHeader = req.headers.authorization?.trim() ?? "";
+  const apiKeyHeader = req.headers["x-api-key"];
+  const bearerToken = bearerHeader.toLowerCase().startsWith("bearer ")
+    ? bearerHeader.slice("bearer ".length).trim()
+    : "";
+  const apiKey =
+    typeof apiKeyHeader === "string"
+      ? apiKeyHeader.trim()
+      : Array.isArray(apiKeyHeader)
+        ? apiKeyHeader[0]?.trim() ?? ""
+        : "";
+
+  if (secureTokenMatch(bearerToken, LOCAL_PROXY_AUTH_TOKEN) || secureTokenMatch(apiKey, LOCAL_PROXY_AUTH_TOKEN)) {
+    return;
+  }
+
+  throw new CompatProxyError(
+    "Local compatibility proxy rejected the request because the session auth token was missing or invalid. Restart Claw Dev and try again.",
+    401,
+    "authentication_error",
+  );
+}
+
+function secureTokenMatch(actual: string, expected: string): boolean {
+  if (!actual || !expected) {
+    return false;
+  }
+
+  const actualBuffer = Buffer.from(actual);
+  const expectedBuffer = Buffer.from(expected);
+  if (actualBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
 function normalizeBaseUrl(value: string): string {
@@ -258,6 +361,27 @@ function parseOptionalInt(value: string | undefined): number | undefined {
 
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function readConfiguredSecret(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const normalized = trimmed.toLowerCase();
+  if (
+    normalized === "changeme" ||
+    normalized === "replace-me" ||
+    normalized === "your_api_key_here" ||
+    (normalized.startsWith("your_") && normalized.endsWith("_here")) ||
+    normalized.includes("placeholder") ||
+    normalized.includes("example")
+  ) {
+    return undefined;
+  }
+
+  return trimmed;
 }
 
 function buildOllamaRuntimeConfig(): Record<string, unknown> {
@@ -303,13 +427,14 @@ function resolveRequestModel(body: AnthropicMessageRequest): string {
     return ACTIVE_MODEL;
   }
 
-  if (PROVIDER === "copilot") {
-    return resolveCopilotRequestedModel(requested);
-  }
-
   const catalog = providerModelCatalog(PROVIDER);
   if (catalog.includes(requested)) {
     return requested;
+  }
+
+  const slotMapped = resolveCompatRequestedModel(requested);
+  if (slotMapped) {
+    return slotMapped;
   }
 
   // Allow custom model ids for user-managed providers even if they are not in the default catalog.
@@ -317,6 +442,7 @@ function resolveRequestModel(body: AnthropicMessageRequest): string {
     PROVIDER === "ollama" ||
     PROVIDER === "zai" ||
     PROVIDER === "groq" ||
+    PROVIDER === "openrouter" ||
     PROVIDER === "openai" ||
     PROVIDER === "gemini"
   ) {
@@ -326,26 +452,26 @@ function resolveRequestModel(body: AnthropicMessageRequest): string {
   return ACTIVE_MODEL;
 }
 
-function resolveCopilotRequestedModel(requested: string): string {
+function resolveCompatRequestedModel(requested: string): string | null {
   const normalized = requested.trim().toLowerCase();
+  const prefix = PROVIDER.toUpperCase();
 
-  if (providerModelCatalog("copilot").includes(requested)) {
-    return requested;
-  }
+  const readSlot = (slot: "HAIKU" | "SONNET" | "OPUS"): string | null =>
+    process.env[`${prefix}_MODEL_${slot}`]?.trim() || null;
 
   if (normalized.includes("opus")) {
-    return process.env.COPILOT_MODEL_OPUS?.trim() || "openai/gpt-4.1";
+    return readSlot("OPUS");
   }
 
   if (normalized.includes("haiku")) {
-    return process.env.COPILOT_MODEL_HAIKU?.trim() || "openai/gpt-4.1-mini";
+    return readSlot("HAIKU");
   }
 
   if (normalized.includes("sonnet") || normalized.startsWith("claude-")) {
-    return process.env.COPILOT_MODEL_SONNET?.trim() || process.env.COPILOT_MODEL?.trim() || "openai/gpt-4.1-mini";
+    return readSlot("SONNET");
   }
 
-  return requested;
+  return null;
 }
 
 async function handleMessages(body: AnthropicMessageRequest) {
@@ -363,6 +489,9 @@ async function handleMessages(body: AnthropicMessageRequest) {
       break;
     case "groq":
       content = await runGroq(body, providerModel);
+      break;
+    case "openrouter":
+      content = await runOpenRouter(body, providerModel);
       break;
     case "ollama":
       content = await runOllama(body, providerModel);
@@ -425,69 +554,71 @@ async function runOpenAI(body: AnthropicMessageRequest, model: string): Promise<
     const rawInput = sliceResponsesInputToLatestToolTurn(openAICompatibleMessagesToResponsesInput(messages));
     const responseTools = openAICompatibleToolsToResponsesTools(tools);
     const compactRequest = compactOpenAIResponsesRequest(instructions, rawInput, responseTools);
-    const response = await fetch("https://chatgpt.com/backend-api/codex/responses", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-        Authorization: `Bearer ${OPENAI_AUTH.bearerToken}`,
-        ...(OPENAI_AUTH.accountId ? { "ChatGPT-Account-Id": OPENAI_AUTH.accountId } : {}),
-        "User-Agent": "codex-cli/0.117.0",
-        originator: "codex_cli_rs",
-        "x-client-request-id": randomUUID(),
-      },
-      body: JSON.stringify({
-        model,
-        instructions: compactRequest.instructions,
-        input: compactRequest.input,
-        tools: compactRequest.tools,
-        tool_choice: buildResponsesToolChoice(body.tool_choice, compactRequest.tools),
-        parallel_tool_calls: true,
-        reasoning: { effort: "none" },
-        store: false,
-        stream: true,
-        include: [],
-        text: {
-          format: { type: "text" },
-          verbosity: "medium",
+    let response: Response;
+    try {
+      response = await fetch("https://chatgpt.com/backend-api/codex/responses", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          Authorization: `Bearer ${OPENAI_AUTH.bearerToken}`,
+          ...(OPENAI_AUTH.accountId ? { "ChatGPT-Account-Id": OPENAI_AUTH.accountId } : {}),
+          "User-Agent": "codex-cli/0.117.0",
+          originator: "codex_cli_rs",
+          "x-client-request-id": randomUUID(),
         },
-      }),
-    });
+        body: JSON.stringify({
+          model,
+          instructions: compactRequest.instructions,
+          input: compactRequest.input,
+          tools: compactRequest.tools,
+          tool_choice: buildResponsesToolChoice(body.tool_choice, compactRequest.tools),
+          parallel_tool_calls: true,
+          reasoning: { effort: "none" },
+          store: false,
+          stream: true,
+          include: [],
+          text: {
+            format: { type: "text" },
+            verbosity: "medium",
+          },
+        }),
+      });
+    } catch (error) {
+      throw networkErrorForProvider("openai", model, "https://chatgpt.com/backend-api/codex/responses", error);
+    }
 
     const sseText = await response.text();
     if (!response.ok) {
-      throw new Error(sseText);
+      throw providerHttpError("openai", response.status, model, sseText);
     }
 
     return parseResponsesSseToResult(sseText).content as AnthropicContentBlock[];
   }
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_AUTH.bearerToken}`,
-    },
-    body: JSON.stringify({
+  const json = await requestOpenAICompatibleJson({
+    provider: "openai",
+    url: "https://api.openai.com/v1/chat/completions",
+    token: OPENAI_AUTH.bearerToken,
+    model,
+    payload: {
       model,
       messages,
       ...(tools.length > 0 ? { tools } : {}),
       ...(tools.length > 0 ? { tool_choice: buildOpenAIToolChoice(body.tool_choice) } : {}),
       stream: false,
-    }),
+    },
   });
-
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-
-  const json = (await response.json()) as Record<string, unknown>;
   return openAIMessageToAnthropicContent(extractOpenAIMessage(json), true);
 }
 
 async function runGemini(body: AnthropicMessageRequest, model: string): Promise<AnthropicContentBlock[]> {
   if (!geminiClient) {
-    throw new Error("Gemini client is not configured");
+    throw new CompatProxyError(
+      "Gemini client is not configured. Set GEMINI_API_KEY and restart Claw Dev.",
+      400,
+      "authentication_error",
+    );
   }
 
   const toolNameById = new Map<string, string>();
@@ -496,24 +627,30 @@ async function runGemini(body: AnthropicMessageRequest, model: string): Promise<
   const toolDeclarations = anthropicToolsToGemini(body.tools ?? []);
   const useInlineSystemPrompt = shouldInlineSystemPrompt(model);
 
-  const response = await geminiClient.models.generateContent({
-    model,
-    contents,
-    config: {
-      ...(!useInlineSystemPrompt && systemInstruction ? { systemInstruction } : {}),
-      ...(toolDeclarations.length > 0
-        ? {
-            tools: [{ functionDeclarations: toolDeclarations }],
-            toolConfig: {
-              functionCallingConfig: buildGeminiFunctionCallingConfig(
-                body.tool_choice,
-                toolDeclarations.map((tool) => tool.name),
-              ),
-            },
-          }
-        : {}),
-    },
-  });
+  let response;
+  try {
+    response = await geminiClient.models.generateContent({
+      model,
+      contents,
+      config: {
+        ...(!useInlineSystemPrompt && systemInstruction ? { systemInstruction } : {}),
+        ...(toolDeclarations.length > 0
+          ? {
+              tools: [{ functionDeclarations: toolDeclarations }],
+              toolConfig: {
+                functionCallingConfig: buildGeminiFunctionCallingConfig(
+                  body.tool_choice,
+                  toolDeclarations.map((tool) => tool.name),
+                ),
+              },
+            }
+          : {}),
+      },
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw providerHttpError("gemini", 400, model, reason);
+  }
 
   const candidateParts = (response.candidates?.[0]?.content?.parts ?? []) as Array<Record<string, unknown>>;
   return geminiPartsToAnthropicContent(candidateParts);
@@ -531,26 +668,51 @@ async function runGroq(body: AnthropicMessageRequest, model: string): Promise<An
   const rawTools = anthropicToolsToOpenAITools(body.tools ?? []);
   const { messages, tools } = compactOpenAICompatibleRequest(systemInstruction, rawMessages, rawTools, "groq");
 
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${GROQ_API_KEY}`,
-    },
-    body: JSON.stringify({
+  const json = await requestOpenAICompatibleJson({
+    provider: "groq",
+    url: "https://api.groq.com/openai/v1/chat/completions",
+    token: GROQ_API_KEY,
+    model,
+    payload: {
       model,
       messages,
       ...(tools.length > 0 ? { tools } : {}),
       ...(tools.length > 0 ? { tool_choice: buildOpenAIToolChoice(body.tool_choice) } : {}),
       stream: false,
-    }),
+    },
   });
+  return openAIMessageToAnthropicContent(extractOpenAIMessage(json), true);
+}
 
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
+async function runOpenRouter(body: AnthropicMessageRequest, model: string): Promise<AnthropicContentBlock[]> {
+  const toolNameById = new Map<string, string>();
+  const systemInstruction = normalizeSystemPrompt(body.system);
+  const rawMessages = anthropicMessagesToOpenAICompatible(
+    body.messages ?? [],
+    toolNameById,
+    systemInstruction,
+    { includeToolNameOnToolMessages: false },
+  );
+  const rawTools = anthropicToolsToOpenAITools(body.tools ?? []);
+  const { messages, tools } = compactOpenAICompatibleRequest(systemInstruction, rawMessages, rawTools, "openrouter");
 
-  const json = (await response.json()) as Record<string, unknown>;
+  const json = await requestOpenAICompatibleJson({
+    provider: "openrouter",
+    url: `${OPENROUTER_BASE_URL}/chat/completions`,
+    token: OPENROUTER_API_KEY,
+    model,
+    extraHeaders: {
+      ...(OPENROUTER_SITE_URL ? { "HTTP-Referer": OPENROUTER_SITE_URL } : {}),
+      ...(OPENROUTER_APP_NAME ? { "X-Title": OPENROUTER_APP_NAME } : {}),
+    },
+    payload: {
+      model,
+      messages,
+      ...(tools.length > 0 ? { tools } : {}),
+      ...(tools.length > 0 ? { tool_choice: buildOpenAIToolChoice(body.tool_choice) } : {}),
+      stream: false,
+    },
+  });
   return openAIMessageToAnthropicContent(extractOpenAIMessage(json), true);
 }
 
@@ -565,23 +727,28 @@ async function runOllama(body: AnthropicMessageRequest, model: string): Promise<
   );
   const tools = anthropicToolsToOpenAITools(body.tools ?? []);
 
-  const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(OLLAMA_API_KEY ? { Authorization: `Bearer ${OLLAMA_API_KEY}` } : {}),
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      ...(tools.length > 0 ? { tools } : {}),
-      ...buildOllamaRuntimeConfig(),
-      stream: false,
-    }),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(OLLAMA_API_KEY ? { Authorization: `Bearer ${OLLAMA_API_KEY}` } : {}),
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        ...(tools.length > 0 ? { tools } : {}),
+        ...buildOllamaRuntimeConfig(),
+        stream: false,
+      }),
+    });
+  } catch (error) {
+    throw networkErrorForProvider("ollama", model, `${OLLAMA_BASE_URL}/api/chat`, error);
+  }
 
   if (!response.ok) {
-    throw new Error(await response.text());
+    throw providerHttpError("ollama", response.status, model, await response.text());
   }
 
   const json = (await response.json()) as Record<string, unknown>;
@@ -600,27 +767,22 @@ async function runCopilot(body: AnthropicMessageRequest, model: string): Promise
   const rawTools = anthropicToolsToOpenAITools(body.tools ?? []);
   const { messages, tools } = compactOpenAICompatibleRequest(systemInstruction, rawMessages, rawTools, "copilot");
 
-  const response = await fetch("https://models.github.ai/inference/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${COPILOT_TOKEN}`,
+  const json = await requestOpenAICompatibleJson({
+    provider: "copilot",
+    url: "https://models.github.ai/inference/chat/completions",
+    token: COPILOT_TOKEN,
+    model,
+    extraHeaders: {
       "X-GitHub-Api-Version": "2022-11-28",
     },
-    body: JSON.stringify({
+    payload: {
       model,
       messages,
       ...(tools.length > 0 ? { tools } : {}),
       ...(tools.length > 0 ? { tool_choice: buildOpenAIToolChoice(body.tool_choice) } : {}),
       stream: false,
-    }),
+    },
   });
-
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-
-  const json = (await response.json()) as Record<string, unknown>;
   return openAIMessageToAnthropicContent(extractOpenAIMessage(json), true);
 }
 
@@ -636,27 +798,174 @@ async function runZai(body: AnthropicMessageRequest, model: string): Promise<Ant
   const rawTools = anthropicToolsToOpenAITools(body.tools ?? []);
   const { messages, tools } = compactOpenAICompatibleRequest(systemInstruction, rawMessages, rawTools, "zai");
 
-  const response = await fetch("https://api.z.ai/api/paas/v4/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${ZAI_API_KEY}`,
-    },
-    body: JSON.stringify({
+  const json = await requestOpenAICompatibleJson({
+    provider: "zai",
+    url: "https://api.z.ai/api/paas/v4/chat/completions",
+    token: ZAI_API_KEY,
+    model,
+    payload: {
       model,
       messages,
       ...(tools.length > 0 ? { tools } : {}),
       ...(tools.length > 0 ? { tool_choice: buildOpenAIToolChoice(body.tool_choice) } : {}),
       stream: false,
-    }),
+    },
   });
+  return openAIMessageToAnthropicContent(extractOpenAIMessage(json), true);
+}
 
-  if (!response.ok) {
-    throw new Error(await response.text());
+async function requestOpenAICompatibleJson({
+  provider,
+  url,
+  token,
+  model,
+  payload,
+  extraHeaders = {},
+}: {
+  provider: "openai" | "groq" | "openrouter" | "copilot" | "zai";
+  url: string;
+  token: string | undefined;
+  model: string;
+  payload: Record<string, unknown>;
+  extraHeaders?: Record<string, string>;
+}): Promise<Record<string, unknown>> {
+  if (!token) {
+    throw new CompatProxyError(
+      `${providerLabel(provider)} is missing a usable API token. Check your environment variables and restart Claw Dev.`,
+      400,
+      "authentication_error",
+    );
   }
 
-  const json = (await response.json()) as Record<string, unknown>;
-  return openAIMessageToAnthropicContent(extractOpenAIMessage(json), true);
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        ...extraHeaders,
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    throw networkErrorForProvider(provider, model, url, error);
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw providerHttpError(provider, response.status, model, text);
+  }
+
+  return (await response.json()) as Record<string, unknown>;
+}
+
+function providerHttpError(provider: CompatProvider, status: number, model: string, rawText: string): CompatProxyError {
+  const details = parseProviderErrorBody(rawText);
+  const message = extractProviderErrorMessage(details, rawText);
+  const normalized = message.toLowerCase();
+  const prefix = `${providerLabel(provider)} request failed for model "${model}".`;
+
+  if (status === 401 || status === 403) {
+    return new CompatProxyError(
+      `${prefix} Authentication was rejected.\nCheck the API key for ${providerLabel(provider)} and confirm the account still has access to this model.\nProvider message: ${message}`,
+      status,
+      "authentication_error",
+    );
+  }
+
+  if (status === 404 || normalized.includes("not found") || normalized.includes("unknown model")) {
+    const modelHint =
+      provider === "openrouter"
+        ? 'OpenRouter model ids usually look like "anthropic/claude-sonnet-4" or "google/gemini-2.5-pro".'
+        : "Check the exact model id for this provider and try again.";
+    return new CompatProxyError(
+      `${prefix} The selected model was not found.\n${modelHint}\nProvider message: ${message}`,
+      status,
+      "invalid_request_error",
+    );
+  }
+
+  if (
+    status === 429 ||
+    normalized.includes("rate limit") ||
+    normalized.includes("quota") ||
+    normalized.includes("resource_exhausted")
+  ) {
+    return new CompatProxyError(
+      `${prefix} The provider hit a rate limit or quota cap.\nTry again later, switch to a smaller model, or use a provider with a higher limit.\nProvider message: ${message}`,
+      429,
+      "rate_limit_error",
+    );
+  }
+
+  if (
+    normalized.includes("context") ||
+    normalized.includes("too large") ||
+    normalized.includes("token limit") ||
+    normalized.includes("max size") ||
+    normalized.includes("maximum context")
+  ) {
+    return new CompatProxyError(
+      `${prefix} The request was larger than this model allows.\nChoose a higher-context model, shorten the conversation, or reduce tool-heavy provider modes.\nProvider message: ${message}`,
+      400,
+      "invalid_request_error",
+    );
+  }
+
+  return new CompatProxyError(`${prefix}\nProvider message: ${message}`, status >= 400 && status < 600 ? status : 500, "api_error");
+}
+
+function networkErrorForProvider(
+  provider: CompatProvider,
+  model: string,
+  url: string,
+  error: unknown,
+): CompatProxyError {
+  const reason = error instanceof Error ? error.message : String(error);
+
+  if (provider === "ollama") {
+    return new CompatProxyError(
+      `Ollama could not be reached at ${OLLAMA_BASE_URL} for model "${model}".\nStart Ollama, confirm the base URL, and make sure the model is already pulled.\nNetwork error: ${reason}`,
+      502,
+      "api_error",
+    );
+  }
+
+  return new CompatProxyError(
+    `${providerLabel(provider)} could not be reached for model "${model}".\nCheck your internet connection, proxy settings, or provider base URL.\nRequest target: ${url}\nNetwork error: ${reason}`,
+    502,
+    "api_error",
+  );
+}
+
+function parseProviderErrorBody(rawText: string): unknown {
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    return rawText;
+  }
+}
+
+function extractProviderErrorMessage(details: unknown, rawText: string): string {
+  if (typeof details === "string") {
+    return details.trim() || rawText.trim() || "Unknown provider error";
+  }
+
+  if (isRecord(details)) {
+    const nested = details.error;
+    if (typeof details.message === "string" && details.message.trim()) {
+      return details.message.trim();
+    }
+    if (isRecord(nested) && typeof nested.message === "string" && nested.message.trim()) {
+      return nested.message.trim();
+    }
+    if (typeof details.detail === "string" && details.detail.trim()) {
+      return details.detail.trim();
+    }
+  }
+
+  return rawText.trim() || "Unknown provider error";
 }
 
 function anthropicMessagesToGemini(
@@ -855,9 +1164,9 @@ function compactOpenAICompatibleRequest(
     type: "function";
     function: { name: string; description: string; parameters: Record<string, unknown> };
   }>,
-  provider: "openai" | "groq" | "copilot" | "zai",
+  provider: "openai" | "groq" | "openrouter" | "copilot" | "zai",
 ) {
-  const budget = provider === "copilot" ? 6000 : provider === "openai" ? 12000 : 20000;
+  const budget = provider === "copilot" ? 6000 : provider === "openai" ? 12000 : provider === "openrouter" ? 18000 : 20000;
   let compactMessages = trimOpenAICompatibleMessages(messages, provider);
   let compactTools = compactOpenAICompatibleTools(tools, provider, "normal");
 
@@ -921,7 +1230,7 @@ function compactOpenAIResponsesRequest(
 
 function trimOpenAICompatibleMessages(
   messages: Array<Record<string, unknown>>,
-  provider: "openai" | "groq" | "copilot" | "zai",
+  provider: "openai" | "groq" | "openrouter" | "copilot" | "zai",
 ): Array<Record<string, unknown>> {
   if (provider !== "copilot") {
     return [...messages];
@@ -951,7 +1260,7 @@ function compactOpenAICompatibleTools(
     type: "function";
     function: { name: string; description: string; parameters: Record<string, unknown> };
   }>,
-  provider: "openai" | "groq" | "copilot" | "zai",
+  provider: "openai" | "groq" | "openrouter" | "copilot" | "zai",
   mode: "normal" | "minimal",
 ) {
   return tools.map((tool) => ({
